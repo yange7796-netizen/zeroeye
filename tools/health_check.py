@@ -38,6 +38,8 @@ import ssl
 import subprocess
 import sys
 import time
+import http.client
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,15 +70,25 @@ MEMORY_THRESHOLD_CRITICAL = 90
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
-    import http.client
+@dataclass
+class AttemptResult:
+    attempt: int
+    elapsed_ms: float
+    status: str
+    detail: str
+    code: int
+    retried: bool = False
+
+
+def check_http_service_once(host: str, port: int, path: str, timeout: float, attempt: int = 1) -> AttemptResult:
+    start = time.time()
+    conn = None
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.request("GET", path)
         resp = conn.getresponse()
         status = resp.status
         body = resp.read().decode("utf-8", errors="replace")[:200]
-        conn.close()
 
         if status == 200:
             result = "OK"
@@ -88,9 +100,65 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
             result = "CRITICAL"
             detail = f"HTTP {status}: {body[:100]}"
 
-        return result, detail, status
+        return AttemptResult(attempt, elapsed_ms(start), result, detail, status)
+    except (socket.timeout, TimeoutError) as e:
+        return AttemptResult(attempt, elapsed_ms(start), "CRITICAL", f"Timeout: {e}", 0)
+    except (ConnectionRefusedError, ConnectionResetError, http.client.HTTPException, OSError) as e:
+        return AttemptResult(attempt, elapsed_ms(start), "CRITICAL", str(e), 0)
     except Exception as e:
-        return "CRITICAL", str(e), 0
+        return AttemptResult(attempt, elapsed_ms(start), "CRITICAL", str(e), 0)
+    finally:
+        if conn:
+            conn.close()
+
+
+def check_http_service(
+    host: str,
+    port: int,
+    path: str,
+    timeout: float,
+    retries: int = 0,
+    backoff_secs: float = 0.0,
+    json_output: bool = False,
+) -> Tuple[str, str, int, List[Dict[str, Any]]]:
+    attempts: List[AttemptResult] = []
+    max_attempts = retries + 1
+
+    for attempt_number in range(1, max_attempts + 1):
+        attempt = check_http_service_once(host, port, path, timeout, attempt_number)
+        should_retry = attempt_number < max_attempts and is_retryable_http_attempt(attempt)
+        attempt.retried = should_retry
+        attempts.append(attempt)
+
+        attempt_summary = (
+            f"HTTP attempt {attempt_number}/{max_attempts}: "
+            f"{attempt.detail} ({attempt.elapsed_ms:.1f}ms)"
+        )
+        print(attempt_summary, file=sys.stderr if json_output else sys.stdout)
+
+        if not should_retry:
+            return attempt.status, attempt.detail, attempt.code, [asdict(item) for item in attempts]
+
+        if backoff_secs > 0:
+            time.sleep(backoff_secs)
+
+    final = attempts[-1]
+    return final.status, final.detail, final.code, [asdict(item) for item in attempts]
+
+
+def is_retryable_http_attempt(attempt: AttemptResult) -> bool:
+    if attempt.code >= 500:
+        return True
+    if attempt.code == 0 and any(
+        marker in attempt.detail.lower()
+        for marker in ("timeout", "timed out", "refused", "reset", "temporarily unavailable")
+    ):
+        return True
+    return False
+
+
+def elapsed_ms(start: float) -> float:
+    return (time.time() - start) * 1000
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
@@ -200,7 +268,13 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(
+    service: Optional[str] = None,
+    json_output: bool = False,
+    retries: int = 0,
+    timeout_secs: Optional[float] = None,
+    backoff_secs: float = 0.0,
+) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -216,14 +290,21 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in SERVICES.items():
         if service and name != service:
             continue
-        status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+        status, detail, code, attempts = check_http_service(
+            config["host"],
+            config["port"],
+            config["path"],
+            timeout_secs if timeout_secs is not None else config["timeout"],
+            retries,
+            backoff_secs,
+            json_output,
         )
         results["services"][name] = {
             "status": status,
             "detail": detail,
             "code": code,
             "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+            "attempts": attempts,
         }
         if status == "CRITICAL":
             all_ok = False
@@ -307,6 +388,9 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument("--retries", type=int, default=0, help="Retry count for transient HTTP health-check failures")
+    parser.add_argument("--timeout-secs", type=float, help="Override HTTP health-check timeout in seconds")
+    parser.add_argument("--backoff-secs", type=float, default=0.0, help="Seconds to wait between retry attempts")
     return parser.parse_args()
 
 
@@ -317,7 +401,13 @@ def main():
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = run_health_checks(
+                    args.service,
+                    args.json,
+                    args.retries,
+                    args.timeout_secs,
+                    args.backoff_secs,
+                )
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +416,13 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = run_health_checks(
+            args.service,
+            args.json,
+            args.retries,
+            args.timeout_secs,
+            args.backoff_secs,
+        )
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
